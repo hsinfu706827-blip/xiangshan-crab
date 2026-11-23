@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -9,7 +10,6 @@ from google.genai import types
 # 1. 初始化 Gemini
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-# 定義目標物種、分數與 AI 辨識特徵
 TARGETS = {
     "弧邊招潮蟹 (Fiddler Crab - 1分)": {
         "points": 1,
@@ -43,7 +43,7 @@ TEAMS = ["Team 1", "Team 2", "Team 3", "Team 4", "Team 5"]
 @st.cache_resource
 def get_game_state():
     progress = {team: {sp: False for sp in TARGETS} for team in TEAMS}
-    gallery = []  # 存放過關紀錄方便老師複查
+    gallery = []
     return {"progress": progress, "gallery": gallery}
 
 state = get_game_state()
@@ -74,7 +74,7 @@ st.dataframe(pd.DataFrame(board_data), hide_index=True, use_container_width=True
 
 st.divider()
 
-# 4. 學生任務上傳區（先選組別 -> 再選對應物種 -> 上傳照片）
+# 4. 學生任務上傳區
 st.subheader("📸 上傳照片解鎖物種 Upload & Verify")
 
 col1, col2 = st.columns(2)
@@ -82,7 +82,6 @@ with col1:
     team = st.selectbox("1️⃣ 選擇組別 Select Team", TEAMS)
 
 with col2:
-    # 標示出該組哪些物種已經解鎖
     species_options = list(TARGETS.keys())
     target_species = st.selectbox(
         "2️⃣ 選擇要解鎖的目標物種 Target Species",
@@ -102,13 +101,17 @@ else:
         img = Image.open(uploaded_file)
         st.image(img, caption=f"{team} 挑戰項目：{target_species}", use_container_width=True)
 
+        # 轉成標準 RGB 並縮小至 1024px，降低伺服器錯誤與加快上傳速度
+        img_for_ai = img.convert("RGB")
+        img_for_ai.thumbnail((1024, 1024))
+
         target_hint = TARGETS[target_species]["hint"]
         prompt = f"""
         你是新竹香山濕地生態競賽的雙語 AI 裁判。
         學生目前聲稱這張照片拍到的是：【{target_species}】。
         該物種的辨識特徵為：{target_hint}
 
-        請嚴格檢驗這張照片並以 JSON 格式回傳結果（不要加 markdown 標記）：
+        請檢驗這張照片並以 JSON 格式回傳結果（不要加 markdown 標記）：
         1. 照片中的生物是否真的是【{target_species}】？（考量學生在木棧道遠距離變焦拍攝，畫質可能略微模糊，若特徵相符請從寬認定；但若是明顯不同物種，例如拿清白招潮蟹冒充台灣招潮蟹，請判為 false）。
         2. 畫面角落是否有「人類手勢或號碼牌」（防作弊機制）？
 
@@ -120,47 +123,25 @@ else:
         }}
         """
 
+        result = None
+        last_error = None
         with st.spinner("AI 裁判比對特徵中... Verifying..."):
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[img, prompt],
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
-            result = json.loads(response.text)
+            for attempt in range(2):
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-3.8-flash",
+                        contents=[img_for_ai, prompt],
+                        config=types.GenerateContentConfig(response_mime_type="application/json")
+                    )
+                    result = json.loads(response.text)
+                    break
+                except Exception as e:
+                    last_error = e
+                    time.sleep(2)
 
-        # 5. 判定過關並更新集點表
-        if result["is_match"] and result["has_hand_sign"]:
-            progress[team][target_species] = True
-            pts = TARGETS[target_species]["points"]
-            # 縮小圖片存入照片牆以節省記憶體
-            thumb = img.copy()
-            thumb.thumbnail((400, 400))
-            gallery.insert(0, {
-                "team": team,
-                "species": target_species,
-                "points": pts,
-                "image": thumb,
-                "feedback": result["feedback"]
-            })
-            st.success(f"🎉 驗證通過！{team} 成功解鎖【{target_species.split(' ')[0]}】（+{pts} 分）")
-            st.balloons()
-            st.info(f"🤖 AI 評語：{result['feedback']}")
-            st.button("🔄 刷新上方計分板")
-        elif result["is_match"] and not result["has_hand_sign"]:
-            st.warning("😅 螃蟹找對了，但 AI 沒看到你們的「專屬手勢」！請重新拍一張有手勢的照片。")
-            st.info(f"🤖 AI 評語：{result['feedback']}")
-        else:
-            st.error(f"❌ 驗證未通過：AI 認為這不是【{target_species.split(' ')[0]}】。")
-            st.info(f"🤖 AI 評語：{result['feedback']}")
+        if result is None:
+            st.warning("⏳ AI 裁判伺服器目前塞車中，請等 10 秒後再按一次「提交」！")
+            st.caption(f"（給老師看的技術代碼：{last_error}）")
+            st.stop()
 
-# 6. 戰利品照片牆（老師現場複查與講評用）
-st.divider()
-with st.expander(f"🖼️ 即時過關照片牆（目前共 {len(gallery)} 筆）", expanded=False):
-    if not gallery:
-        st.caption("目前還沒有組別解鎖物種，快去尋找第一隻螃蟹吧！")
-    else:
-        for item in gallery:
-            st.markdown(f"**{item['team']}** 解鎖了 **{item['species']}**")
-            st.image(item["image"], width=300)
-            st.caption(item["feedback"])
-            st.markdown("---")
+        # 5.
