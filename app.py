@@ -7,14 +7,25 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# 1. 初始化 Gemini 與備用模型清單（輕量版放第一順位，降低 503 塞車機率）
+# 1. 初始化 Gemini 與自動抓取可用模型清單
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-MODEL_FALLBACK_LIST = [
-    "gemini-3.8-flash-lite",  # 首選：輕量高速，較不易塞車
-    "gemini-3.8-flash",       # 備用 1：平衡型
-    "gemini-3.8-pro",         # 備用 2：高階視覺辨識
-]
+@st.cache_data(ttl=3600)
+def get_available_models():
+    models = []
+    try:
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            # 篩選支援文字/視覺辨識的 Gemini 模型，排除語音、向量等非對話模型
+            if "gemini" in name and not any(k in name for k in ["embedding", "aqa", "tts", "audio", "live", "imagen", "veo"]):
+                models.append(name)
+    except Exception:
+        pass
+    # 優先使用 flash 系列，最多輪流嘗試 4 個可用模型
+    models.sort(key=lambda x: (0 if "3.8-flash" in x else 1 if "flash" in x else 2))
+    return models[:4] if models else ["gemini-3.8-flash"]
+
+MODEL_FALLBACK_LIST = get_available_models()
 
 TARGETS = {
     "弧邊招潮蟹 (Fiddler Crab - 1分)": {
@@ -150,6 +161,7 @@ else:
         if result is None:
             st.warning("⏳ 所有 AI 裁判目前都在塞車中，請等 10 秒後再按一次「提交」！")
             with st.expander("給老師看的錯誤紀錄"):
+                st.caption(f"本次嘗試的模型清單：{MODEL_FALLBACK_LIST}")
                 for log in error_logs:
                     st.caption(log)
             st.stop()
